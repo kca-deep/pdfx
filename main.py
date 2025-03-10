@@ -81,8 +81,8 @@ class APIUsageTracker:
         self.exchange_rate = exchange_rate  # 1 USD = 1450 KRW
         self.model_costs = {
             "gpt-4o-mini": {
-                "input": 0.000002,  # 입력 토큰당 비용 (USD) - 1000토큰당 $0.002
-                "output": 0.000002,  # 출력 토큰당 비용 (USD) - 1000토큰당 $0.002
+                "input": 0.00000015,  # 입력 토큰당 비용 (USD) - 1000토큰당 $0.00015
+                "output": 0.0000006,  # 출력 토큰당 비용 (USD) - 1000토큰당 $0.00060
             },
             "gpt-4o": {
                 "input": 0.000003,  # 1000토큰당 $0.003
@@ -205,8 +205,9 @@ def analyze_ocr_with_openai(ocr_result):
         prompt = f"""
 다음은 OCR로 추출한 텍스트입니다. 이 텍스트에서 다음 정보를 추출해주세요:
 
-1. 5~7행에 있는 금액 데이터: 연간집행, 기수령액, 계획액, 월집행, 이월액, 전월, 신청액, 당월, 누계
-2. 22~24행에 있는 은행 정보: 은행명, 계좌번호, 예금주
+1. 신청일자 정보: 문서에서 신청일자, 작성일자, 기안일자 등을 찾아 'YYYY-MM-DD' 형식으로 변환
+2. 5~7행에 있는 금액 데이터: 연간집행, 기수령액, 계획액, 월집행, 이월액, 전월, 신청액, 당월, 누계
+3. 22~24행에 있는 은행 정보: 은행명, 계좌번호, 예금주
 
 추출한 정보를 다음 JSON 형식으로 반환해주세요:
 {{
@@ -249,7 +250,8 @@ def analyze_ocr_with_openai(ocr_result):
             "항목": "예금주",
             "값": "예금주"
         }}
-    ]
+    ],
+    "신청일자": "YYYY-MM-DD"  # 신청일자가 없는 경우 null 반환
 }}
 OCR 텍스트:
 {all_text}
@@ -260,7 +262,7 @@ OCR 텍스트:
         
         # 토큰 수 계산
         prompt_tokens = api_tracker.count_tokens(prompt)
-        
+
         # OpenAI API 요청 데이터 준비
         payload = {
             "model": model,
@@ -313,6 +315,7 @@ OCR 텍스트:
                     return json.loads(json_text)
                 else:
                     logging.error("응답에서 JSON 형식을 찾을 수 없습니다.")
+                    logging.error(f"원본 응답: {response_text}")
                     return None
             except json.JSONDecodeError as e:
                 logging.error(f"JSON 파싱 오류: {str(e)}")
@@ -500,7 +503,7 @@ class FileHandler(FileSystemEventHandler):
             return
 
         file_path = event.src_path
-        
+
         # 파일 처리
         try:
             process_file(file_path)
@@ -569,7 +572,7 @@ def convert_pdf_to_images(pdf_path, pbar=None):
         # PyMuPDF를 사용하여 PDF를 이미지로 변환
         pdf_document = fitz.open(pdf_path)
         image_paths = []
-        
+
         # PDF 페이지 변환
         for page_num in range(len(pdf_document)):
             page = pdf_document.load_page(page_num)
@@ -900,6 +903,7 @@ def process_file(file_path, pbar=None):
         file_name = file_path.name
         file_base_name = file_path.stem
         current_date = datetime.now().strftime("%Y%m%d")
+        current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M")  # 처리시간 형식 수정
 
         # 결과 디렉토리 확인 및 생성 (날짜별 폴더 구조)
         result_dir = Path(RESULT_DIR) / current_date
@@ -930,7 +934,7 @@ def process_file(file_path, pbar=None):
 
             # 각 이미지에 대해 OCR 처리
             all_ocr_results = []
-            
+
             if pbar:
                 pbar.set_description(f"OCR 처리 중: {file_path.name}")
                 pbar.refresh()
@@ -976,12 +980,18 @@ def process_file(file_path, pbar=None):
                     if "파일_정보" not in analyzed_data:
                         analyzed_data["파일_정보"] = []
 
+                    # 신청일자 정보 추가
+                    if "신청일자" in analyzed_data and analyzed_data["신청일자"]:
+                        analyzed_data["파일_정보"].append(
+                            {"항목": "신청일자", "값": analyzed_data["신청일자"]}
+                        )
+
                     analyzed_data["파일_정보"].append(
                         {"항목": "원본파일명", "값": file_path.name}
                     )
 
                     analyzed_data["파일_정보"].append(
-                        {"항목": "처리시간", "값": current_date}
+                        {"항목": "처리시간", "값": current_datetime}  # current_date 대신 current_datetime 사용
                     )
 
                     analyzed_data["파일_정보"].append(
@@ -1063,12 +1073,18 @@ def process_file(file_path, pbar=None):
                 if "파일_정보" not in analyzed_data:
                     analyzed_data["파일_정보"] = []
 
+                # 신청일자 정보 추가
+                if "신청일자" in analyzed_data and analyzed_data["신청일자"]:
+                    analyzed_data["파일_정보"].append(
+                        {"항목": "신청일자", "값": analyzed_data["신청일자"]}
+                    )
+
                 analyzed_data["파일_정보"].append(
                     {"항목": "원본파일명", "값": file_path.name}
                 )
 
                 analyzed_data["파일_정보"].append(
-                    {"항목": "처리시간", "값": current_date}
+                    {"항목": "처리시간", "값": current_datetime}  # current_date 대신 current_datetime 사용
                 )
 
                 # 구조화된 Excel 파일로 내보내기 (공통 파일에 추가)
@@ -1113,12 +1129,12 @@ def process_existing_files():
 
     # 소스 디렉토리에서 지원되는 파일 찾기
     files = [f for f in source_dir.glob("*") if f.suffix.lower() in supported_extensions]
-    
+
     if not files:
         return
-        
+
     logging.info(f"총 {len(files)}개 파일 발견")
-    
+
     # 전체 작업량 계산
     total_steps = 0
     for file_path in files:
@@ -1187,7 +1203,7 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         observer.stop()
-    observer.join()
+        observer.join()
 
     # 프로그램 종료 메시지
     print("프로그램을 종료합니다.")
