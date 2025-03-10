@@ -8,7 +8,7 @@ import requests
 import mimetypes
 from pathlib import Path
 from datetime import datetime
-from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver as Observer  # Python 3.13 호환성을 위해 PollingObserver 사용
 from watchdog.events import FileSystemEventHandler
 from dotenv import load_dotenv
 import openpyxl
@@ -16,8 +16,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 import io
 import traceback
-
-# import openai  # OpenAI API 사용을 위한 라이브러리 추가 - requests 라이브러리로 대체
+from tqdm import tqdm  # 진행률 표시를 위한 라이브러리
 
 # 환경 변수 로드
 load_dotenv(override=True)  # override=True로 설정하여 기존 환경 변수를 덮어씁니다.
@@ -31,16 +30,16 @@ if not log_dir.exists():
 current_date = datetime.now().strftime("%Y%m%d")
 log_filename = log_dir / f"pdfx_{current_date}.log"
 
-# 로깅 설정
+# 로깅 설정 최적화 - 콘솔 출력 제거, 파일에만 기록
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(str(log_filename), mode="a", encoding="utf-8"),
-        logging.StreamHandler(),
     ],
 )
 
+# 로그 파일 경로 기록 (파일에만 기록)
 logging.info(f"로그 파일 경로: {log_filename}")
 
 # 네이버 클로바 OCR API 설정
@@ -51,13 +50,6 @@ CLOVA_OCR_API_SECRET = os.getenv("CLOVA_OCR_SECRET_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 # openai.api_key = OPENAI_API_KEY  # requests 라이브러리로 대체
-
-# 설정 로그
-logging.info(f"CLOVA OCR API URL: {CLOVA_OCR_API_URL}")
-if CLOVA_OCR_API_SECRET:
-    logging.info(
-        f"CLOVA OCR API SECRET: {CLOVA_OCR_API_SECRET[:4]}...{CLOVA_OCR_API_SECRET[-4:]} (길이: {len(CLOVA_OCR_API_SECRET)})"
-    )
 
 # 기타 설정
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 16777216))  # 기본값: 16MB
@@ -74,6 +66,112 @@ ALL_SUPPORTED_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS + [SUPPORTED_PDF_EXTENSION
 for directory in [TEMP_DIR, SOURCE_DIR, RESULT_DIR]:
     os.makedirs(directory, exist_ok=True)
 
+# 콘솔 출력 설정 - 진행률 표시를 위한 tqdm 사용
+print(f"PDF-X 프로그램 시작 (로그 파일: {log_filename})")
+print(f"소스 디렉토리: {os.path.abspath(SOURCE_DIR)}")
+print(f"결과 디렉토리: {os.path.abspath(RESULT_DIR)}")
+
+# OpenAI API 사용량 추적 클래스
+class APIUsageTracker:
+    def __init__(self, exchange_rate=1450):
+        self.total_tokens = 0
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_cost_usd = 0.0
+        self.exchange_rate = exchange_rate  # 1 USD = 1450 KRW
+        self.model_costs = {
+            "gpt-4o-mini": {
+                "input": 0.000002,  # 입력 토큰당 비용 (USD) - 1000토큰당 $0.002
+                "output": 0.000002,  # 출력 토큰당 비용 (USD) - 1000토큰당 $0.002
+            },
+            "gpt-4o": {
+                "input": 0.000003,  # 1000토큰당 $0.003
+                "output": 0.000006,  # 1000토큰당 $0.006
+            },
+            "gpt-3.5-turbo": {
+                "input": 0.0000005,  # 1000토큰당 $0.0005
+                "output": 0.0000015,  # 1000토큰당 $0.0015
+            }
+        }
+        self.default_model = "gpt-4o-mini"
+    
+    def count_tokens(self, text):
+        """텍스트의 토큰 수를 대략적으로 계산합니다. (tiktoken 없이 간단한 방식 사용)"""
+        # 영어 기준으로 단어 4개당 약 3개의 토큰으로 계산 (OpenAI 문서 기준)
+        # 한글은 더 많은 토큰을 사용하므로 글자 수 기준으로 계산
+        words = text.split()
+        word_count = len(words)
+        char_count = len(text)
+        
+        # 한글이 포함된 경우 글자 수 기준으로 계산 (한글 1글자당 약 1.5 토큰)
+        has_korean = any(ord(char) >= 0xAC00 and ord(char) <= 0xD7A3 for char in text)
+        
+        if has_korean:
+            return int(char_count * 1.5)
+        else:
+            return int(word_count * 0.75)
+    
+    def update_usage(self, prompt_tokens, completion_tokens, model=None):
+        """API 사용량을 업데이트합니다."""
+        if model is None:
+            model = self.default_model
+            
+        if model not in self.model_costs:
+            model = self.default_model
+            
+        # 토큰 수 업데이트
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+        self.total_tokens += prompt_tokens + completion_tokens
+        
+        # 비용 계산
+        prompt_cost = prompt_tokens * self.model_costs[model]["input"]
+        completion_cost = completion_tokens * self.model_costs[model]["output"]
+        cost_usd = prompt_cost + completion_cost
+        self.total_cost_usd += cost_usd
+        
+        # 로그에 사용량 기록
+        cost_krw = cost_usd * self.exchange_rate
+        total_cost_krw = self.total_cost_usd * self.exchange_rate
+        
+        # 1000토큰 단위로 비용 표시 (가독성 향상)
+        prompt_cost_per_1k = self.model_costs[model]["input"] * 1000
+        completion_cost_per_1k = self.model_costs[model]["output"] * 1000
+        
+        logging.info(f"API 사용량 업데이트: 모델={model}, 입력 토큰={prompt_tokens}, 출력 토큰={completion_tokens}")
+        logging.info(f"토큰 비용 (1000토큰당): 입력=${prompt_cost_per_1k:.4f}, 출력=${completion_cost_per_1k:.4f}")
+        logging.info(f"현재 호출 비용: ${cost_usd:.6f} (₩{cost_krw:.2f})")
+        logging.info(f"누적 API 사용량: 총 토큰={self.total_tokens}, 입력={self.total_prompt_tokens}, 출력={self.total_completion_tokens}")
+        logging.info(f"누적 API 비용: ${self.total_cost_usd:.6f} (₩{total_cost_krw:.2f})")
+        
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "cost_usd": cost_usd,
+            "cost_krw": cost_krw
+        }
+    
+    def get_usage_summary(self):
+        """API 사용량 요약을 반환합니다."""
+        return {
+            "total_tokens": self.total_tokens,
+            "prompt_tokens": self.total_prompt_tokens,
+            "completion_tokens": self.total_completion_tokens,
+            "cost_usd": self.total_cost_usd,
+            "cost_krw": self.total_cost_usd * self.exchange_rate
+        }
+
+# API 사용량 추적기 인스턴스 생성
+api_tracker = APIUsageTracker(exchange_rate=1450)
+
+# 설정 로그
+logging.info(f"CLOVA OCR API URL: {CLOVA_OCR_API_URL}")
+if CLOVA_OCR_API_SECRET:
+    logging.info(
+        f"CLOVA OCR API SECRET: {CLOVA_OCR_API_SECRET[:4]}...{CLOVA_OCR_API_SECRET[-4:]} (길이: {len(CLOVA_OCR_API_SECRET)})"
+    )
+
 
 def analyze_ocr_with_openai(ocr_result):
     """OpenAI API를 사용하여 OCR 결과 분석 (requests 라이브러리 사용)"""
@@ -82,8 +180,6 @@ def analyze_ocr_with_openai(ocr_result):
         return None
 
     try:
-        logging.info("OpenAI API를 사용하여 OCR 결과 분석 시작")
-
         # OCR 결과에서 텍스트 추출
         all_text = ""
         if "images" in ocr_result and ocr_result["images"]:
@@ -159,9 +255,15 @@ OCR 텍스트:
 {all_text}
 """
 
+        # 사용할 모델
+        model = "gpt-4o-mini"
+        
+        # 토큰 수 계산
+        prompt_tokens = api_tracker.count_tokens(prompt)
+        
         # OpenAI API 요청 데이터 준비
         payload = {
-            "model": "gpt-4o-mini",  # 모델 지정
+            "model": model,
             "messages": [
                 {
                     "role": "system",
@@ -179,44 +281,46 @@ OCR 텍스트:
             "Authorization": f"Bearer {OPENAI_API_KEY}",
         }
 
-        # OpenAI API 호출 (requests 사용)
-        logging.info("OpenAI API 요청 전송 중...")
-        response = requests.post(OPENAI_API_URL, headers=headers, json=payload)
+        # API 요청
+        response = requests.post(
+            OPENAI_API_URL, headers=headers, data=json.dumps(payload)
+        )
 
         # 응답 확인
         if response.status_code == 200:
-            response_data = response.json()
+            result = response.json()
+            
+            # 응답에서 토큰 사용량 추출
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            
+            # API 사용량 업데이트 (응답에서 실제 토큰 수를 가져옴)
+            if prompt_tokens == 0:  # API가 토큰 수를 반환하지 않는 경우 추정값 사용
+                prompt_tokens = api_tracker.count_tokens(prompt)
+                
+            api_tracker.update_usage(prompt_tokens, completion_tokens, model)
+            
+            # 응답 텍스트 추출
+            response_text = result["choices"][0]["message"]["content"]
 
-            # 응답 추출
-            if "choices" in response_data and len(response_data["choices"]) > 0:
-                result_text = response_data["choices"][0]["message"]["content"]
-
-                # JSON 부분 추출
-                json_start = result_text.find("{")
-                json_end = result_text.rfind("}") + 1
-
+            try:
+                # JSON 형식으로 파싱
+                json_start = response_text.find("{")
+                json_end = response_text.rfind("}") + 1
                 if json_start >= 0 and json_end > json_start:
-                    json_str = result_text[json_start:json_end]
-                    try:
-                        result_data = json.loads(json_str)
-                        logging.info("OpenAI API를 통한 데이터 추출 성공")
-                        return result_data
-                    except json.JSONDecodeError as e:
-                        logging.error(f"JSON 파싱 오류: {str(e)}")
-                        logging.error(f"원본 JSON 문자열: {json_str}")
+                    json_text = response_text[json_start:json_end]
+                    return json.loads(json_text)
                 else:
                     logging.error("응답에서 JSON 형식을 찾을 수 없습니다.")
-                    logging.error(f"전체 응답: {result_text}")
-            else:
-                logging.error("응답에 choices 필드가 없습니다.")
-                logging.error(f"전체 응답: {response_data}")
+                    return None
+            except json.JSONDecodeError as e:
+                logging.error(f"JSON 파싱 오류: {str(e)}")
+                logging.error(f"원본 응답: {response_text}")
+                return None
         else:
-            logging.error(
-                f"OpenAI API 호출 실패: {response.status_code} {response.reason}"
-            )
-            logging.error(f"응답 내용: {response.text}")
-
-        return None
+            logging.error(f"API 요청 실패: {response.status_code} - {response.text}")
+            return None
 
     except Exception as e:
         logging.error(f"OpenAI API 호출 중 오류 발생: {str(e)}")
@@ -396,8 +500,7 @@ class FileHandler(FileSystemEventHandler):
             return
 
         file_path = event.src_path
-        logging.info(f"새 파일 감지: {file_path}")
-
+        
         # 파일 처리
         try:
             process_file(file_path)
@@ -420,17 +523,12 @@ def is_valid_file(file_path):
     file_ext = file_path.suffix.lower()
     if file_ext not in ALL_SUPPORTED_EXTENSIONS:
         logging.error(f"지원되지 않는 파일 형식: {file_ext}")
-        logging.error(
-            f"현재 버전에서는 이미지 파일({', '.join(SUPPORTED_IMAGE_EXTENSIONS)}) 및 PDF 파일({SUPPORTED_PDF_EXTENSION})만 지원합니다."
-        )
         return False
 
     # 파일 크기 확인
     file_size = file_path.stat().st_size
     if file_size > MAX_FILE_SIZE:
-        logging.error(
-            f"파일 크기가 너무 큽니다: {file_size} 바이트 (최대: {MAX_FILE_SIZE} 바이트)"
-        )
+        logging.error(f"파일 크기가 너무 큽니다: {file_size} 바이트 (최대: {MAX_FILE_SIZE} 바이트)")
         return False
 
     # PDF가 아닌 경우 MIME 타입 확인
@@ -443,7 +541,7 @@ def is_valid_file(file_path):
     return True
 
 
-def convert_pdf_to_images(pdf_path):
+def convert_pdf_to_images(pdf_path, pbar=None):
     """PDF 파일을 이미지로 변환"""
     pdf_path = Path(pdf_path)
     logging.info(f"PDF 변환 시작: {pdf_path}")
@@ -458,16 +556,11 @@ def convert_pdf_to_images(pdf_path):
         if temp_dir.exists():
             try:
                 import shutil
-
                 shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception as e:
                 logging.warning(f"기존 임시 폴더 삭제 실패: {str(e)}")
                 # 폴더 삭제 실패 시 새로운 이름으로 시도
-                temp_dir = (
-                    Path(TEMP_DIR)
-                    / current_date
-                    / f"{pdf_path.stem}_{process_id}_{int(time.time())}"
-                )
+                temp_dir = Path(TEMP_DIR) / current_date / f"{pdf_path.stem}_{process_id}_{int(time.time())}"
 
         # 임시 폴더 생성 (상위 폴더가 없는 경우 모두 생성)
         temp_dir.parent.mkdir(exist_ok=True, parents=True)
@@ -476,7 +569,8 @@ def convert_pdf_to_images(pdf_path):
         # PyMuPDF를 사용하여 PDF를 이미지로 변환
         pdf_document = fitz.open(pdf_path)
         image_paths = []
-
+        
+        # PDF 페이지 변환
         for page_num in range(len(pdf_document)):
             page = pdf_document.load_page(page_num)
 
@@ -501,17 +595,11 @@ def convert_pdf_to_images(pdf_path):
                 # 이미지 저장
                 pix.save(str(image_path))
                 image_paths.append(image_path)
+                if pbar:
+                    pbar.update(1)
+                    pbar.refresh()
             except Exception as e:
                 logging.error(f"이미지 저장 실패 (페이지 {page_num + 1}): {str(e)}")
-                # 메모리에서 이미지 데이터를 가져와 PIL로 저장 시도
-                try:
-                    img_data = pix.tobytes("png")
-                    img = Image.open(io.BytesIO(img_data))
-                    img.save(str(image_path))
-                    image_paths.append(image_path)
-                    logging.info(f"대체 방법으로 이미지 저장 성공: {image_path}")
-                except Exception as e2:
-                    logging.error(f"대체 방법으로도 이미지 저장 실패: {str(e2)}")
 
         pdf_document.close()
 
@@ -536,8 +624,6 @@ def call_clova_ocr_api(file_path):
         )
         return None
 
-    logging.info(f"OCR API 호출 시작: {file_path}")
-
     # 파일 경로를 Path 객체로 변환
     file_path = Path(file_path)
 
@@ -561,9 +647,6 @@ def call_clova_ocr_api(file_path):
     while retry_count < max_retries:
         try:
             if is_custom_api:
-                # 커스텀 OCR API 요청 형식 (multipart/form-data)
-                logging.info("커스텀 OCR API 요청 형식 사용")
-
                 # 현재 시간 타임스탬프
                 timestamp = int(time.time() * 1000)
 
@@ -740,74 +823,6 @@ def call_clova_ocr_api(file_path):
     return None
 
 
-def parse_ocr_result(result):
-    """OCR 결과 파싱 (원본 좌표 정보 포함)"""
-    parsed_data = {"text": [], "tables": []}
-
-    if not result or "images" not in result or not result["images"]:
-        logging.error("OCR 결과가 없거나 형식이 올바르지 않습니다.")
-        return parsed_data
-
-    image_result = result["images"][0]
-
-    # 텍스트 필드 추출 (원본 좌표 정보 포함)
-    if "fields" in image_result:
-        for field in image_result["fields"]:
-            if "inferText" in field:
-                # 텍스트 정보와 함께 원본 필드 정보도 저장
-                parsed_data["text"].append(
-                    {
-                        "text": field["inferText"],
-                        "confidence": field.get("inferConfidence", 0),
-                        "field_info": field,  # 원본 필드 정보 (boundingPoly 등 포함)
-                    }
-                )
-
-    # 표 데이터 추출
-    if "tables" in image_result:
-        for table_idx, table in enumerate(image_result["tables"]):
-            table_data = {
-                "table_idx": table_idx,
-                "cells": [],
-                "table_info": table,  # 원본 테이블 정보 저장
-            }
-
-            if "cells" in table:
-                for cell in table["cells"]:
-                    cell_text = ""
-
-                    # 셀 텍스트 라인 추출
-                    if "cellTextLines" in cell:
-                        for line in cell["cellTextLines"]:
-                            line_text = []
-
-                            if "cellWords" in line:
-                                for word in line["cellWords"]:
-                                    if "inferText" in word:
-                                        line_text.append(word["inferText"])
-
-                            if line_text:
-                                cell_text += " ".join(line_text) + "\n"
-
-                    cell_text = cell_text.strip()
-
-                    # 셀 정보와 함께 원본 셀 정보도 저장
-                    table_data["cells"].append(
-                        {
-                            "row": cell.get("rowIndex", 0),
-                            "col": cell.get("columnIndex", 0),
-                            "row_span": cell.get("rowSpan", 1),
-                            "col_span": cell.get("columnSpan", 1),
-                            "text": cell_text,
-                            "cell_info": cell,  # 원본 셀 정보 저장
-                        }
-                    )
-
-            parsed_data["tables"].append(table_data)
-
-    return parsed_data
-
-
 def is_number(text):
     """텍스트가 숫자인지 확인"""
     # 쉼표와 공백 제거
@@ -870,298 +885,8 @@ def convert_to_number(text):
         return text  # 변환 실패 시 원본 텍스트 반환
 
 
-def export_to_excel(parsed_data, output_path):
-    """파싱된 데이터를 Excel 파일로 내보내기 (라인 기준으로 정리하고 열별로 세분화)"""
-    wb = openpyxl.Workbook()
-
-    # 기본 시트 가져오기
-    main_sheet = wb.active
-    main_sheet.title = "OCR 결과"
-
-    # 텍스트 필드 정보 추출 및 정렬
-    text_fields = []
-    for idx, text_item in enumerate(parsed_data["text"], 1):
-        # 원본 필드 정보 가져오기 (boundingPoly 정보 포함)
-        field_info = text_item.get("field_info", {})
-
-        # 좌표 정보 추출
-        vertices = field_info.get("boundingPoly", {}).get("vertices", [])
-        if vertices:
-            # 좌표의 평균값 계산
-            x_coords = [vertex.get("x", 0) for vertex in vertices]
-            y_coords = [vertex.get("y", 0) for vertex in vertices]
-            avg_x = sum(x_coords) / len(x_coords) if x_coords else 0
-            avg_y = sum(y_coords) / len(y_coords) if y_coords else 0
-
-            # 텍스트 정보 저장
-            text_fields.append(
-                {
-                    "idx": idx,
-                    "text": text_item["text"],
-                    "confidence": text_item["confidence"],
-                    "x": avg_x,
-                    "y": avg_y,
-                    "width": max(x_coords) - min(x_coords) if x_coords else 0,
-                    "height": max(y_coords) - min(y_coords) if y_coords else 0,
-                }
-            )
-
-    # Y좌표로 정렬 (위에서 아래로)
-    text_fields.sort(key=lambda x: x["y"])
-
-    # 라인 그룹화 (Y좌표가 비슷한 텍스트를 같은 라인으로 그룹화)
-    line_threshold = 20  # Y좌표 차이가 이 값보다 작으면 같은 라인으로 간주
-    lines = []
-    current_line = []
-
-    for i, field in enumerate(text_fields):
-        if i == 0:
-            # 첫 번째 필드는 현재 라인에 추가
-            current_line.append(field)
-        else:
-            # 이전 필드와 Y좌표 차이 계산
-            prev_y = text_fields[i - 1]["y"]
-            curr_y = field["y"]
-
-            if abs(curr_y - prev_y) <= line_threshold:
-                # 같은 라인으로 간주
-                current_line.append(field)
-            else:
-                # 새로운 라인 시작
-                if current_line:
-                    # 현재 라인을 X좌표로 정렬
-                    current_line.sort(key=lambda x: x["x"])
-                    lines.append(current_line)
-                current_line = [field]
-
-    # 마지막 라인 추가
-    if current_line:
-        current_line.sort(key=lambda x: x["x"])
-        lines.append(current_line)
-
-    # 열 구분을 위한 X좌표 클러스터링
-    all_x_coords = [field["x"] for field in text_fields]
-
-    # X좌표 클러스터링 (K-means 대신 간단한 방법 사용)
-    def cluster_x_coordinates(x_coords, threshold=100):
-        if not x_coords:
-            return []
-
-        # 정렬된 X좌표
-        sorted_x = sorted(x_coords)
-
-        # 클러스터 초기화
-        clusters = [[sorted_x[0]]]
-
-        # 각 X좌표를 적절한 클러스터에 할당
-        for x in sorted_x[1:]:
-            # 이전 클러스터의 마지막 값과 비교
-            if x - clusters[-1][-1] > threshold:
-                # 새 클러스터 시작
-                clusters.append([x])
-            else:
-                # 기존 클러스터에 추가
-                clusters[-1].append(x)
-
-        # 각 클러스터의 중심값 계산
-        cluster_centers = [sum(cluster) / len(cluster) for cluster in clusters]
-        return cluster_centers
-
-    # X좌표 클러스터 중심 계산
-    x_clusters = cluster_x_coordinates(all_x_coords)
-    max_columns = len(x_clusters) + 1  # 여유 있게 열 개수 설정
-
-    # 헤더 추가 (열 개수에 맞게)
-    headers = ["라인"] + [f"열_{i+1}" for i in range(max_columns)] + ["신뢰도"]
-    main_sheet.append(headers)
-
-    # 라인별로 엑셀에 추가
-    for line_idx, line in enumerate(lines, 1):
-        # 라인의 평균 신뢰도 계산
-        avg_confidence = (
-            sum([field["confidence"] for field in line]) / len(line) if line else 0
-        )
-
-        # 각 필드를 적절한 열에 배치
-        row_data = [line_idx] + [""] * max_columns + [f"{avg_confidence:.4f}"]
-
-        for field in line:
-            # 가장 가까운 클러스터 찾기
-            if x_clusters:
-                closest_cluster_idx = min(
-                    range(len(x_clusters)),
-                    key=lambda i: abs(field["x"] - x_clusters[i]),
-                )
-                # 해당 열에 텍스트 추가 (이미 텍스트가 있으면 공백으로 구분하여 추가)
-                col_idx = closest_cluster_idx + 1  # 첫 번째 열은 라인 번호
-                if row_data[col_idx] == "":
-                    row_data[col_idx] = field["text"]
-                else:
-                    row_data[col_idx] += " " + field["text"]
-            else:
-                # 클러스터가 없는 경우 첫 번째 데이터 열에 추가
-                if row_data[1] == "":
-                    row_data[1] = field["text"]
-                else:
-                    row_data[1] += " " + field["text"]
-
-        # 엑셀에 라인 추가
-        main_sheet.append(row_data)
-
-    # 표 시트 생성
-    if parsed_data["tables"]:
-        for table_idx, table_data in enumerate(parsed_data["tables"], 1):
-            table_sheet = wb.create_sheet(f"표_{table_idx}")
-
-            # 표 데이터 구성
-            if table_data["cells"]:
-                # 행과 열 크기 결정
-                max_row = max([cell["row"] for cell in table_data["cells"]]) + 1
-                max_col = max([cell["col"] for cell in table_data["cells"]]) + 1
-
-                # 2D 배열 초기화
-                table_array = [[None for _ in range(max_col)] for _ in range(max_row)]
-
-                # 셀 데이터 채우기
-                for cell in table_data["cells"]:
-                    row = cell["row"]
-                    col = cell["col"]
-                    cell_text = cell["text"]
-
-                    # 숫자 데이터 처리
-                    if is_number(cell_text):
-                        # 숫자로 변환
-                        cell_value = convert_to_number(cell_text)
-                    else:
-                        cell_value = cell_text
-
-                    table_array[row][col] = cell_value
-
-                # 시트에 데이터 추가
-                for row_idx, row_data in enumerate(table_array, 1):
-                    # None 값을 빈 문자열로 변환
-                    formatted_row = ["" if cell is None else cell for cell in row_data]
-
-                    # 행 추가
-                    for col_idx, cell_value in enumerate(formatted_row, 1):
-                        cell = table_sheet.cell(row=row_idx, column=col_idx)
-                        cell.value = cell_value
-
-                        # 숫자 형식 지정
-                        if isinstance(cell_value, (int, float)):
-                            # 금액 형식으로 표시
-                            cell.number_format = "#,##0"
-
-                # 표 서식 지정
-                for row_idx in range(1, max_row + 1):
-                    for col_idx in range(1, max_col + 1):
-                        cell = table_sheet.cell(row=row_idx, column=col_idx)
-                        # 테두리 설정
-                        cell.border = openpyxl.styles.Border(
-                            left=openpyxl.styles.Side(style="thin"),
-                            right=openpyxl.styles.Side(style="thin"),
-                            top=openpyxl.styles.Side(style="thin"),
-                            bottom=openpyxl.styles.Side(style="thin"),
-                        )
-
-                # 첫 번째 행을 헤더로 설정
-                for col_idx in range(1, max_col + 1):
-                    cell = table_sheet.cell(row=1, column=col_idx)
-                    cell.font = openpyxl.styles.Font(bold=True)
-                    cell.fill = openpyxl.styles.PatternFill(
-                        start_color="E0E0E0", end_color="E0E0E0", fill_type="solid"
-                    )
-
-                # 자동 필터 설정
-                table_sheet.auto_filter.ref = (
-                    f"A1:{openpyxl.utils.get_column_letter(max_col)}{max_row}"
-                )
-
-                # 열 너비 자동 조정
-                for col_idx in range(1, max_col + 1):
-                    column_letter = openpyxl.utils.get_column_letter(col_idx)
-                    max_length = 0
-                    for row_idx in range(1, max_row + 1):
-                        cell = table_sheet.cell(row=row_idx, column=col_idx)
-                        if cell.value:
-                            cell_length = len(str(cell.value))
-                            if cell_length > max_length:
-                                max_length = cell_length
-                    adjusted_width = (max_length + 2) * 1.2
-                    table_sheet.column_dimensions[column_letter].width = adjusted_width
-
-    # 원본 데이터 시트 추가 (디버깅용)
-    debug_sheet = wb.create_sheet("원본 데이터")
-    debug_sheet.append(
-        ["번호", "텍스트", "신뢰도", "X좌표", "Y좌표", "너비", "높이", "숫자여부"]
-    )
-
-    for idx, field in enumerate(text_fields, 1):
-        debug_sheet.append(
-            [
-                idx,
-                field["text"],
-                field["confidence"],
-                field["x"],
-                field["y"],
-                field["width"],
-                field["height"],
-                "숫자" if is_number(field["text"]) else "텍스트",
-            ]
-        )
-
-    # 클러스터 정보 시트 추가 (디버깅용)
-    cluster_sheet = wb.create_sheet("X좌표 클러스터")
-    cluster_sheet.append(["클러스터 번호", "중심 X좌표"])
-
-    for idx, center in enumerate(x_clusters, 1):
-        cluster_sheet.append([idx, center])
-
-    # 열 너비 자동 조정
-    for sheet in wb.worksheets:
-        for column in sheet.columns:
-            max_length = 0
-            column_letter = openpyxl.utils.get_column_letter(column[0].column)
-            for cell in column:
-                if cell.value:
-                    cell_length = len(str(cell.value))
-                    if cell_length > max_length:
-                        max_length = cell_length
-            adjusted_width = (max_length + 2) * 1.2
-            sheet.column_dimensions[column_letter].width = adjusted_width
-
-    # 파일 저장
-    wb.save(output_path)
-    logging.info(f"Excel 파일 저장 완료: {output_path}")
-    logging.info(
-        f"총 {len(lines)}개 라인, {len(x_clusters)}개 열, {len(parsed_data['tables'])}개 표 저장됨"
-    )
-
-
-def merge_ocr_results(results):
-    """여러 OCR 결과를 하나로 병합"""
-    merged_data = {"text": [], "tables": []}
-
-    table_count = 0
-
-    for result in results:
-        # 텍스트 병합
-        merged_data["text"].extend(result["text"])
-
-        # 표 병합 (테이블 인덱스 조정)
-        for table in result["tables"]:
-            table_copy = table.copy()
-            table_copy["table_idx"] = table_count
-            merged_data["tables"].append(table_copy)
-            table_count += 1
-
-    return merged_data
-
-
-def process_file(file_path):
+def process_file(file_path, pbar=None):
     """파일 처리 함수"""
-    logging.info(f"파일 처리 시작: {file_path}")
-
     # 파일 경로를 Path 객체로 변환
     file_path = Path(file_path)
 
@@ -1175,56 +900,55 @@ def process_file(file_path):
         file_name = file_path.name
         file_base_name = file_path.stem
         current_date = datetime.now().strftime("%Y%m%d")
-        process_id = os.getpid()  # 프로세스 ID 추가
 
         # 결과 디렉토리 확인 및 생성 (날짜별 폴더 구조)
         result_dir = Path(RESULT_DIR) / current_date
         if not result_dir.exists():
             try:
                 result_dir.mkdir(parents=True, exist_ok=True)
-                logging.info(f"결과 디렉토리 생성: {result_dir}")
             except Exception as e:
                 logging.error(f"결과 디렉토리 생성 실패: {str(e)}")
                 # 대체 경로 사용
                 result_dir = Path(os.getcwd()) / "results" / current_date
                 result_dir.mkdir(parents=True, exist_ok=True)
-                logging.info(f"대체 결과 디렉토리 생성: {result_dir}")
 
         # 공통 output.xlsx 파일 경로 설정
         common_output_path = result_dir / "output.xlsx"
 
         # PDF 파일 처리
         if file_path.suffix.lower() == SUPPORTED_PDF_EXTENSION:
-            logging.info(f"PDF 파일 처리 시작: {file_path}")
+            if pbar:
+                pbar.set_description(f"PDF 변환 중: {file_path.name}")
+                pbar.refresh()
 
             # PDF를 이미지로 변환
-            image_paths = convert_pdf_to_images(file_path)
+            image_paths = convert_pdf_to_images(file_path, pbar)
 
             if not image_paths:
-                logging.error(
-                    f"PDF 변환 실패 또는 변환된 이미지가 없습니다: {file_path}"
-                )
+                logging.error(f"PDF 변환 실패 또는 변환된 이미지가 없습니다: {file_path}")
                 return
 
             # 각 이미지에 대해 OCR 처리
             all_ocr_results = []
+            
+            if pbar:
+                pbar.set_description(f"OCR 처리 중: {file_path.name}")
+                pbar.refresh()
 
             for i, image_path in enumerate(image_paths):
-                logging.info(
-                    f"PDF 페이지 {i+1}/{len(image_paths)} 처리 중: {image_path}"
-                )
-
                 # OCR API 호출
                 ocr_result = call_clova_ocr_api(image_path)
+                
+                if pbar:
+                    pbar.update(1)
+                    pbar.refresh()
 
                 if not ocr_result:
                     logging.error(f"OCR API 호출 실패: {image_path}")
                     continue
 
                 # JSON 결과 저장 (각 페이지별)
-                page_json_path = (
-                    result_dir / f"{file_base_name}_page{i+1}_{process_id}.json"
-                )
+                page_json_path = result_dir / f"{file_base_name}_page{i+1}_{os.getpid()}.json"
 
                 try:
                     with open(page_json_path, "w", encoding="utf-8") as f:
@@ -1232,16 +956,17 @@ def process_file(file_path):
                 except Exception as e:
                     logging.error(f"JSON 결과 저장 실패: {str(e)}")
                     # 대체 경로 시도
-                    page_json_path = (
-                        Path(os.getcwd())
-                        / f"{file_base_name}_page{i+1}_{process_id}.json"
-                    )
+                    page_json_path = Path(os.getcwd()) / f"{file_base_name}_page{i+1}_{os.getpid()}.json"
                     with open(page_json_path, "w", encoding="utf-8") as f:
                         json.dump(ocr_result, f, ensure_ascii=False, indent=2)
 
                 all_ocr_results.append(ocr_result)
 
             # 모든 OCR 결과 분석
+            if pbar:
+                pbar.set_description(f"데이터 분석 중: {file_path.name}")
+                pbar.refresh()
+
             for i, ocr_result in enumerate(all_ocr_results):
                 # OpenAI API를 사용하여 OCR 결과 분석
                 analyzed_data = analyze_ocr_with_openai(ocr_result)
@@ -1266,33 +991,20 @@ def process_file(file_path):
                     # 구조화된 Excel 파일로 내보내기 (공통 파일에 추가)
                     try:
                         export_to_structured_excel(analyzed_data, common_output_path)
-                        logging.info(
-                            f"데이터가 공통 Excel 파일에 추가되었습니다: {common_output_path}"
-                        )
+                        logging.info(f"데이터가 공통 Excel 파일에 추가되었습니다: {common_output_path}")
                     except Exception as e:
                         logging.error(f"공통 Excel 파일 저장 실패: {str(e)}")
                         # 대체 경로 시도
                         alt_output_path = Path(os.getcwd()) / "output.xlsx"
                         try:
                             export_to_structured_excel(analyzed_data, alt_output_path)
-                            logging.info(
-                                f"대체 경로에 Excel 파일 저장 성공: {alt_output_path}"
-                            )
+                            logging.info(f"대체 경로에 Excel 파일 저장 성공: {alt_output_path}")
                         except Exception as e2:
-                            logging.error(
-                                f"대체 경로에도 Excel 파일 저장 실패: {str(e2)}"
-                            )
+                            logging.error(f"대체 경로에도 Excel 파일 저장 실패: {str(e2)}")
                             # 마지막 대안으로 개별 파일 저장
-                            individual_output_path = (
-                                result_dir
-                                / f"output_{file_base_name}_{current_date}.xlsx"
-                            )
-                            export_to_structured_excel(
-                                analyzed_data, individual_output_path
-                            )
-                            logging.info(
-                                f"개별 Excel 파일 저장 성공: {individual_output_path}"
-                            )
+                            individual_output_path = result_dir / f"output_{file_base_name}_{current_date}.xlsx"
+                            export_to_structured_excel(analyzed_data, individual_output_path)
+                            logging.info(f"개별 Excel 파일 저장 성공: {individual_output_path}")
 
             # 처리 완료 후 임시 파일 정리 시도
             try:
@@ -1308,7 +1020,6 @@ def process_file(file_path):
                 if temp_dir and temp_dir.exists():
                     try:
                         import shutil
-
                         shutil.rmtree(temp_dir, ignore_errors=True)
                     except:
                         pass  # 삭제 실패 무시
@@ -1320,17 +1031,29 @@ def process_file(file_path):
             # 이미지 파일 처리
             logging.info(f"이미지 파일 처리 시작: {file_path}")
 
+            if pbar:
+                pbar.set_description(f"OCR 처리 중: {file_path.name}")
+                pbar.refresh()
+
             # OCR API 호출
             ocr_result = call_clova_ocr_api(file_path)
+
+            if pbar:
+                pbar.update(1)
+                pbar.refresh()
 
             if not ocr_result:
                 logging.error(f"OCR API 호출 실패: {file_path}")
                 return
 
             # JSON 결과 저장
-            json_result_path = result_dir / f"{file_base_name}_{process_id}.json"
+            json_result_path = result_dir / f"{file_base_name}_{os.getpid()}.json"
             with open(json_result_path, "w", encoding="utf-8") as f:
                 json.dump(ocr_result, f, ensure_ascii=False, indent=2)
+
+            if pbar:
+                pbar.set_description(f"데이터 분석 중: {file_path.name}")
+                pbar.refresh()
 
             # OpenAI API를 사용하여 OCR 결과 분석
             analyzed_data = analyze_ocr_with_openai(ocr_result)
@@ -1351,30 +1074,20 @@ def process_file(file_path):
                 # 구조화된 Excel 파일로 내보내기 (공통 파일에 추가)
                 try:
                     export_to_structured_excel(analyzed_data, common_output_path)
-                    logging.info(
-                        f"데이터가 공통 Excel 파일에 추가되었습니다: {common_output_path}"
-                    )
+                    logging.info(f"데이터가 공통 Excel 파일에 추가되었습니다: {common_output_path}")
                 except Exception as e:
                     logging.error(f"공통 Excel 파일 저장 실패: {str(e)}")
                     # 대체 경로 시도
                     alt_output_path = Path(os.getcwd()) / "output.xlsx"
                     try:
                         export_to_structured_excel(analyzed_data, alt_output_path)
-                        logging.info(
-                            f"대체 경로에 Excel 파일 저장 성공: {alt_output_path}"
-                        )
+                        logging.info(f"대체 경로에 Excel 파일 저장 성공: {alt_output_path}")
                     except Exception as e2:
                         logging.error(f"대체 경로에도 Excel 파일 저장 실패: {str(e2)}")
                         # 마지막 대안으로 개별 파일 저장
-                        individual_output_path = (
-                            result_dir / f"output_{file_base_name}_{current_date}.xlsx"
-                        )
-                        export_to_structured_excel(
-                            analyzed_data, individual_output_path
-                        )
-                        logging.info(
-                            f"개별 Excel 파일 저장 성공: {individual_output_path}"
-                        )
+                        individual_output_path = result_dir / f"output_{file_base_name}_{current_date}.xlsx"
+                        export_to_structured_excel(analyzed_data, individual_output_path)
+                        logging.info(f"개별 Excel 파일 저장 성공: {individual_output_path}")
 
             logging.info(f"이미지 파일 처리 완료: {file_path}")
 
@@ -1384,93 +1097,100 @@ def process_file(file_path):
 
 
 def process_existing_files():
-    """기존 파일 처리 함수"""
-    logging.info("기존 파일 처리 시작")
-
-    # 소스 디렉토리의 모든 파일 가져오기
+    """기존 파일 처리"""
+    # 소스 디렉토리 확인
     source_dir = Path(SOURCE_DIR)
-    files = list(source_dir.glob("*"))
+    if not source_dir.exists():
+        try:
+            source_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"소스 디렉토리 생성: {source_dir}")
+        except Exception as e:
+            logging.error(f"소스 디렉토리 생성 실패: {str(e)}")
+            return
 
+    # 지원되는 파일 확장자 목록
+    supported_extensions = ALL_SUPPORTED_EXTENSIONS
+
+    # 소스 디렉토리에서 지원되는 파일 찾기
+    files = [f for f in source_dir.glob("*") if f.suffix.lower() in supported_extensions]
+    
     if not files:
-        logging.info("처리할 파일이 없습니다.")
         return
-
+        
     logging.info(f"총 {len(files)}개 파일 발견")
-
-    # 각 파일 처리
+    
+    # 전체 작업량 계산
+    total_steps = 0
     for file_path in files:
-        if file_path.is_file():
+        if file_path.suffix.lower() == SUPPORTED_PDF_EXTENSION:
+            # PDF 파일인 경우 페이지 수 확인
             try:
-                process_file(file_path)
+                pdf_document = fitz.open(file_path)
+                total_steps += len(pdf_document) * 2  # PDF 변환 및 OCR 처리
+                pdf_document.close()
             except Exception as e:
-                logging.error(f"파일 처리 중 오류 발생: {str(e)}")
-                logging.error(traceback.format_exc())
+                logging.error(f"PDF 페이지 수 확인 실패: {str(e)}")
+                total_steps += 2  # 기본값으로 2단계 추가
+        else:
+            total_steps += 1  # 이미지 파일은 1단계
 
-    logging.info("기존 파일 처리 완료")
+    # tqdm을 사용하여 통합 진행률 표시
+    with tqdm(total=total_steps, desc="파일 처리", ncols=80, dynamic_ncols=False, file=sys.stdout) as pbar:
+        for file_path in files:
+            if file_path.is_file():
+                try:
+                    process_file(file_path, pbar)
+                except Exception as e:
+                    logging.error(f"파일 처리 중 오류 발생: {str(e)}")
+                    logging.error(traceback.format_exc())
 
 
 def main():
     """메인 함수"""
     logging.info("프로그램 시작")
-    logging.info(f"소스 디렉토리: {os.path.abspath(SOURCE_DIR)}")
-    logging.info(f"결과 디렉토리: {os.path.abspath(RESULT_DIR)}")
+    
+    # 환경 변수 로드
+    load_dotenv()
 
-    # 환경 변수 확인
-    if not CLOVA_OCR_API_SECRET:
-        logging.warning("경고: CLOVA_OCR_SECRET_KEY 환경 변수가 설정되지 않았습니다.")
-        print("경고: CLOVA_OCR_SECRET_KEY 환경 변수를 설정해야 합니다.")
-        print(
-            "  .env 파일에 CLOVA_OCR_SECRET_KEY=your_api_key_here 형식으로 추가하거나"
-        )
-        print("  환경 변수로 직접 설정하세요.")
+    # 필수 환경 변수 검증
+    required_env_vars = [
+        "CLOVA_OCR_APIGW_INVOKE_URL",
+        "CLOVA_OCR_SECRET_KEY",
+        "OPENAI_API_KEY",
+    ]
+    for var in required_env_vars:
+        if not os.getenv(var):
+            logging.error(f"필수 환경 변수 {var}가 설정되지 않았습니다.")
+            sys.exit(1)
 
-    if not OPENAI_API_KEY:
-        logging.warning("경고: OPENAI_API_KEY 환경 변수가 설정되지 않았습니다.")
-        print("경고: OPENAI_API_KEY 환경 변수를 설정해야 합니다.")
-        print("  .env 파일에 OPENAI_API_KEY=your_api_key_here 형식으로 추가하거나")
-        print("  환경 변수로 직접 설정하세요.")
+    # 환경 변수 로드
+    CLOVA_OCR_API_URL = os.getenv("CLOVA_OCR_APIGW_INVOKE_URL")
+    CLOVA_OCR_API_SECRET = os.getenv("CLOVA_OCR_SECRET_KEY")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-    # API URL 확인
-    logging.info(f"CLOVA OCR API URL: {CLOVA_OCR_API_URL}")
+    # 소스 디렉토리 및 결과 디렉토리 설정
+    SOURCE_DIR = Path("source")
+    RESULT_DIR = Path("result")
 
     # 기존 파일 처리
     process_existing_files()
 
     try:
-        # 파일 시스템 감시 설정
+        # 파일 감시 시작
         event_handler = FileHandler()
-        observer = Observer()
+        observer = Observer()  # watchdog.observers.polling.PollingObserver() 대신 Observer 사용
         observer.schedule(event_handler, SOURCE_DIR, recursive=False)
+        observer.start()
 
-        # 감시 시작
-        try:
-            observer.start()
-            logging.info(
-                f"{SOURCE_DIR} 디렉토리 감시 중... (종료하려면 Ctrl+C를 누르세요)"
-            )
-
-            # 무한 루프로 감시 유지
-            while True:
-                time.sleep(1)
-        except Exception as e:
-            logging.error(f"감시 시작 중 오류 발생: {str(e)}")
-            logging.error(traceback.format_exc())
-
-            # 대체 방법: 기존 파일만 처리하고 종료
-            logging.info(
-                "파일 감시 기능을 사용할 수 없습니다. 기존 파일만 처리하고 종료합니다."
-            )
-
+        print(f"파일 감시 시작: {SOURCE_DIR}")
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        if "observer" in locals() and observer.is_alive():
-            observer.stop()
-            observer.join()
+        observer.stop()
+    observer.join()
 
-    except Exception as e:
-        logging.error(f"프로그램 실행 중 오류 발생: {str(e)}")
-        logging.error(traceback.format_exc())
-
-    logging.info("프로그램 종료")
+    # 프로그램 종료 메시지
+    print("프로그램을 종료합니다.")
 
 
 if __name__ == "__main__":

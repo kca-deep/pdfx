@@ -1,7 +1,7 @@
-watchdog==3.0.0
-requests==2.31.0
-openpyxl==3.1.2
-tqdm==4.66.1
-python-dotenv==1.0.0
-PyMuPDF==1.23.8
-Pillow==10.1.0 
+watchdog==6.0.0  # Python 3.13과 호환되는 최신 버전
+requests==2.31.0  # HTTP 요청 처리
+openpyxl==3.1.2  # Excel 파일 처리
+tqdm==4.66.1  # 진행률 표시
+python-dotenv==1.0.0  # 환경 변수 관리
+PyMuPDF==1.25.3  # PDF 처리 (Python 3.13과 호환)
+Pillow==11.1.0  # 이미지 처리 (Python 3.13과 호환) 
