@@ -1,0 +1,56 @@
+# 환경 변수 파일
+.env
+
+# 로그 파일
+*.log
+script.log
+app.log
+
+# 임시 폴더
+/temp/
+/temp/*
+
+# 소스 및 결과 폴더 내용물 (폴더 자체는 유지)
+/source/*
+!/source/.gitkeep
+/result/*
+!/result/.gitkeep
+
+# 테스트 결과
+test_result.json
+test_image.png
+
+# Python 관련
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 가상 환경
+venv/
+ENV/
+env/
+.venv/
+
+# IDE 관련
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store 
