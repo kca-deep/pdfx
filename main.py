@@ -49,7 +49,6 @@ CLOVA_OCR_API_SECRET = os.getenv("CLOVA_OCR_SECRET_KEY")
 # OpenAI API 설정
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-# openai.api_key = OPENAI_API_KEY  # requests 라이브러리로 대체
 
 # 기타 설정
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 16777216))  # 기본값: 16MB
@@ -151,16 +150,6 @@ class APIUsageTracker:
             "cost_usd": cost_usd,
             "cost_krw": cost_krw
         }
-    
-    def get_usage_summary(self):
-        """API 사용량 요약을 반환합니다."""
-        return {
-            "total_tokens": self.total_tokens,
-            "prompt_tokens": self.total_prompt_tokens,
-            "completion_tokens": self.total_completion_tokens,
-            "cost_usd": self.total_cost_usd,
-            "cost_krw": self.total_cost_usd * self.exchange_rate
-        }
 
 # API 사용량 추적기 인스턴스 생성
 api_tracker = APIUsageTracker(exchange_rate=1450)
@@ -208,6 +197,8 @@ def analyze_ocr_with_openai(ocr_result):
 1. 신청일자 정보: 문서에서 신청일자, 작성일자, 기안일자 등을 찾아 'YYYY-MM-DD' 형식으로 변환
 2. 5~7행에 있는 금액 데이터: 연간집행, 기수령액, 계획액, 월집행, 이월액, 전월, 신청액, 당월, 누계
 3. 22~24행에 있는 은행 정보: 은행명, 계좌번호, 예금주
+4. 첫번째 행에서 '기금구분': 방송통신발전기금, 정보통신진흥기금 중 문서에 있는 값
+5. '목/세목': 민간위탁사업비, 민간경상보조, 사업출연금 중 문서에 있는 값
 
 추출한 정보를 다음 JSON 형식으로 반환해주세요:
 {{
@@ -251,7 +242,9 @@ def analyze_ocr_with_openai(ocr_result):
             "값": "예금주"
         }}
     ],
-    "신청일자": "YYYY-MM-DD"  # 신청일자가 없는 경우 null 반환
+    "신청일자": "YYYY-MM-DD",  # 신청일자가 없는 경우 null 반환
+    "기금구분": "기금구분"  # 기금구분 값: 방송통신발전기금, 정보통신진흥기금 중 하나
+    "목세목": "목세목",  # 목/세목 값: 민간위탁사업비, 민간경상보조, 사업출연금 중 하나
 }}
 OCR 텍스트:
 {all_text}
@@ -826,68 +819,6 @@ def call_clova_ocr_api(file_path):
     return None
 
 
-def is_number(text):
-    """텍스트가 숫자인지 확인"""
-    # 쉼표와 공백 제거
-    cleaned_text = text.replace(",", "").replace(" ", "")
-
-    # 원화 기호(₩) 또는 달러 기호($) 제거
-    if cleaned_text.startswith("₩") or cleaned_text.startswith("$"):
-        cleaned_text = cleaned_text[1:]
-
-    # 숫자 단위 제거 (만, 억, 천, k, m 등)
-    units = ["만", "억", "천", "k", "m", "K", "M"]
-    for unit in units:
-        if cleaned_text.endswith(unit):
-            cleaned_text = cleaned_text[: -len(unit)]
-
-    # 소수점이 있는 경우
-    if "." in cleaned_text:
-        parts = cleaned_text.split(".")
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            return True
-
-    # 정수인 경우
-    return cleaned_text.isdigit()
-
-
-def convert_to_number(text):
-    """텍스트를 숫자로 변환 (가능한 경우)"""
-    try:
-        # 쉼표와 공백 제거
-        cleaned_text = text.replace(",", "").replace(" ", "")
-
-        # 원화 기호(₩) 또는 달러 기호($) 제거
-        if cleaned_text.startswith("₩") or cleaned_text.startswith("$"):
-            cleaned_text = cleaned_text[1:]
-
-        # 숫자 단위 처리 (만, 억, 천, k, m 등)
-        multiplier = 1
-        if cleaned_text.endswith("만"):
-            multiplier = 10000
-            cleaned_text = cleaned_text[:-1]
-        elif cleaned_text.endswith("억"):
-            multiplier = 100000000
-            cleaned_text = cleaned_text[:-1]
-        elif cleaned_text.endswith("천"):
-            multiplier = 1000
-            cleaned_text = cleaned_text[:-1]
-        elif cleaned_text.endswith("k") or cleaned_text.endswith("K"):
-            multiplier = 1000
-            cleaned_text = cleaned_text[:-1]
-        elif cleaned_text.endswith("m") or cleaned_text.endswith("M"):
-            multiplier = 1000000
-            cleaned_text = cleaned_text[:-1]
-
-        # 숫자로 변환
-        if "." in cleaned_text:
-            return float(cleaned_text) * multiplier
-        else:
-            return int(cleaned_text) * multiplier
-    except:
-        return text  # 변환 실패 시 원본 텍스트 반환
-
-
 def process_file(file_path, pbar=None):
     """파일 처리 함수"""
     # 파일 경로를 Path 객체로 변환
@@ -986,6 +917,24 @@ def process_file(file_path, pbar=None):
                             {"항목": "신청일자", "값": analyzed_data["신청일자"]}
                         )
 
+                    # 기금구분 정보 추가 (가장 먼저 추가)
+                    if "기금구분" in analyzed_data and analyzed_data["기금구분"]:
+                        analyzed_data["파일_정보"].append(
+                            {"항목": "기금구분", "값": analyzed_data["기금구분"]}
+                        )
+
+                    # 세부사업 정보 추가
+                    if "세부사업" in analyzed_data and analyzed_data["세부사업"]:
+                        analyzed_data["파일_정보"].append(
+                            {"항목": "세부사업", "값": analyzed_data["세부사업"]}
+                        )
+                        
+                    # 목세목 정보 추가
+                    if "목세목" in analyzed_data and analyzed_data["목세목"]:
+                        analyzed_data["파일_정보"].append(
+                            {"항목": "목세목", "값": analyzed_data["목세목"]}
+                        )
+
                     analyzed_data["파일_정보"].append(
                         {"항목": "원본파일명", "값": file_path.name}
                     )
@@ -1073,10 +1022,28 @@ def process_file(file_path, pbar=None):
                 if "파일_정보" not in analyzed_data:
                     analyzed_data["파일_정보"] = []
 
+                # 기금구분 정보 추가 (가장 먼저 추가)
+                if "기금구분" in analyzed_data and analyzed_data["기금구분"]:
+                    analyzed_data["파일_정보"].append(
+                        {"항목": "기금구분", "값": analyzed_data["기금구분"]}
+                    )
+
                 # 신청일자 정보 추가
                 if "신청일자" in analyzed_data and analyzed_data["신청일자"]:
                     analyzed_data["파일_정보"].append(
                         {"항목": "신청일자", "값": analyzed_data["신청일자"]}
+                    )
+
+                # 세부사업 정보 추가
+                if "세부사업" in analyzed_data and analyzed_data["세부사업"]:
+                    analyzed_data["파일_정보"].append(
+                        {"항목": "세부사업", "값": analyzed_data["세부사업"]}
+                    )
+                    
+                # 목세목 정보 추가
+                if "목세목" in analyzed_data and analyzed_data["목세목"]:
+                    analyzed_data["파일_정보"].append(
+                        {"항목": "목세목", "값": analyzed_data["목세목"]}
                     )
 
                 analyzed_data["파일_정보"].append(
@@ -1085,6 +1052,10 @@ def process_file(file_path, pbar=None):
 
                 analyzed_data["파일_정보"].append(
                     {"항목": "처리시간", "값": current_datetime}  # current_date 대신 current_datetime 사용
+                )
+
+                analyzed_data["파일_정보"].append(
+                    {"항목": "페이지번호", "값": f"{i+1}/{len(all_ocr_results)}"}
                 )
 
                 # 구조화된 Excel 파일로 내보내기 (공통 파일에 추가)
@@ -1165,9 +1136,6 @@ def main():
     """메인 함수"""
     logging.info("프로그램 시작")
     
-    # 환경 변수 로드
-    load_dotenv()
-
     # 필수 환경 변수 검증
     required_env_vars = [
         "CLOVA_OCR_APIGW_INVOKE_URL",
@@ -1178,11 +1146,6 @@ def main():
         if not os.getenv(var):
             logging.error(f"필수 환경 변수 {var}가 설정되지 않았습니다.")
             sys.exit(1)
-
-    # 환경 변수 로드
-    CLOVA_OCR_API_URL = os.getenv("CLOVA_OCR_APIGW_INVOKE_URL")
-    CLOVA_OCR_API_SECRET = os.getenv("CLOVA_OCR_SECRET_KEY")
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
     # 소스 디렉토리 및 결과 디렉토리 설정
     SOURCE_DIR = Path("source")
