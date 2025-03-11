@@ -52,9 +52,9 @@ OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 # 기타 설정
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 16777216))  # 기본값: 16MB
-TEMP_DIR = os.getenv("TEMP_DIR", "temp")
-SOURCE_DIR = os.getenv("SOURCE_DIR", "source")
-RESULT_DIR = os.getenv("RESULT_DIR", "result")
+TEMP_DIR = Path(os.getenv("TEMP_DIR", "temp"))
+SOURCE_DIR = Path(os.getenv("SOURCE_DIR", "source"))
+RESULT_DIR = Path(os.getenv("RESULT_DIR", "result"))
 
 # 지원하는 파일 확장자
 SUPPORTED_IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"]
@@ -63,12 +63,12 @@ ALL_SUPPORTED_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS + [SUPPORTED_PDF_EXTENSION
 
 # 필요한 디렉토리 생성
 for directory in [TEMP_DIR, SOURCE_DIR, RESULT_DIR]:
-    os.makedirs(directory, exist_ok=True)
+    directory.mkdir(exist_ok=True, parents=True)
 
 # 콘솔 출력 설정 - 진행률 표시를 위한 tqdm 사용
 print(f"PDF-X 프로그램 시작 (로그 파일: {log_filename})")
-print(f"소스 디렉토리: {os.path.abspath(SOURCE_DIR)}")
-print(f"결과 디렉토리: {os.path.abspath(RESULT_DIR)}")
+print(f"소스 디렉토리: {SOURCE_DIR.absolute()}")
+print(f"결과 디렉토리: {RESULT_DIR.absolute()}")
 
 # OpenAI API 사용량 추적 클래스
 class APIUsageTracker:
@@ -332,7 +332,7 @@ def export_to_structured_excel(analyzed_data, output_path):
 
     try:
         # 기존 파일 존재 여부 확인
-        file_exists = os.path.isfile(output_path)
+        file_exists = Path(output_path).is_file()
 
         if file_exists:
             # 기존 파일이 있는 경우 로드
@@ -495,7 +495,7 @@ class FileHandler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        file_path = event.src_path
+        file_path = Path(event.src_path)
 
         # 파일 처리
         try:
@@ -545,7 +545,7 @@ def convert_pdf_to_images(pdf_path, pbar=None):
     # 날짜 기반 임시 폴더 생성
     current_date = datetime.now().strftime("%Y%m%d")
     process_id = os.getpid()
-    temp_dir = Path(TEMP_DIR) / current_date / f"{pdf_path.stem}_{process_id}"
+    temp_dir = TEMP_DIR / current_date / f"{pdf_path.stem}_{process_id}"
 
     try:
         # 임시 폴더가 이미 존재하는 경우 삭제 시도
@@ -556,7 +556,7 @@ def convert_pdf_to_images(pdf_path, pbar=None):
             except Exception as e:
                 logging.warning(f"기존 임시 폴더 삭제 실패: {str(e)}")
                 # 폴더 삭제 실패 시 새로운 이름으로 시도
-                temp_dir = Path(TEMP_DIR) / current_date / f"{pdf_path.stem}_{process_id}_{int(time.time())}"
+                temp_dir = TEMP_DIR / current_date / f"{pdf_path.stem}_{process_id}_{int(time.time())}"
 
         # 임시 폴더 생성 (상위 폴더가 없는 경우 모두 생성)
         temp_dir.parent.mkdir(exist_ok=True, parents=True)
@@ -819,6 +819,121 @@ def call_clova_ocr_api(file_path):
     return None
 
 
+def process_ocr_result(ocr_result, file_path, result_dir, page_num=None, total_pages=None, pbar=None):
+    """OCR 결과를 처리하고 JSON으로 저장하는 함수"""
+    file_base_name = file_path.stem
+    
+    # JSON 결과 저장
+    if page_num is not None:
+        # PDF 페이지별 JSON 저장
+        json_path = result_dir / f"{file_base_name}_page{page_num}_{os.getpid()}.json"
+    else:
+        # 단일 이미지 JSON 저장
+        json_path = result_dir / f"{file_base_name}_{os.getpid()}.json"
+    
+    try:
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(ocr_result, f, ensure_ascii=False, indent=2)
+        logging.info(f"JSON 결과 저장 완료: {json_path}")
+    except Exception as e:
+        logging.error(f"JSON 결과 저장 실패: {str(e)}")
+        # 대체 경로 시도
+        json_path = Path.cwd() / f"{file_base_name}_{os.getpid()}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(ocr_result, f, ensure_ascii=False, indent=2)
+    
+    if pbar:
+        pbar.set_description(f"데이터 분석 중: {file_path.name}")
+        pbar.refresh()
+    
+    # OpenAI API를 사용하여 OCR 결과 분석
+    analyzed_data = analyze_ocr_with_openai(ocr_result)
+    
+    return analyzed_data
+
+def add_file_info(analyzed_data, file_path, current_datetime, page_num=None, total_pages=None):
+    """분석된 데이터에 파일 정보를 추가하는 함수"""
+    if not analyzed_data:
+        return analyzed_data
+    
+    # 원본 파일 정보 추가
+    if "파일_정보" not in analyzed_data:
+        analyzed_data["파일_정보"] = []
+    
+    # 기금구분 정보 추가 (가장 먼저 추가)
+    if "기금구분" in analyzed_data and analyzed_data["기금구분"]:
+        analyzed_data["파일_정보"].append(
+            {"항목": "기금구분", "값": analyzed_data["기금구분"]}
+        )
+    
+    # 신청일자 정보 추가
+    if "신청일자" in analyzed_data and analyzed_data["신청일자"]:
+        analyzed_data["파일_정보"].append(
+            {"항목": "신청일자", "값": analyzed_data["신청일자"]}
+        )
+    
+    # 세부사업 정보 추가
+    if "세부사업" in analyzed_data and analyzed_data["세부사업"]:
+        analyzed_data["파일_정보"].append(
+            {"항목": "세부사업", "값": analyzed_data["세부사업"]}
+        )
+    
+    # 목세목 정보 추가
+    if "목세목" in analyzed_data and analyzed_data["목세목"]:
+        analyzed_data["파일_정보"].append(
+            {"항목": "목세목", "값": analyzed_data["목세목"]}
+        )
+    
+    # 파일명 정보 추가
+    analyzed_data["파일_정보"].append(
+        {"항목": "원본파일명", "값": file_path.name}
+    )
+    
+    # 처리시간 정보 추가
+    analyzed_data["파일_정보"].append(
+        {"항목": "처리시간", "값": current_datetime}
+    )
+    
+    # 페이지 정보 추가 (PDF인 경우)
+    if page_num is not None and total_pages is not None:
+        analyzed_data["파일_정보"].append(
+            {"항목": "페이지번호", "값": f"{page_num}/{total_pages}"}
+        )
+    
+    return analyzed_data
+
+def save_to_excel(analyzed_data, common_output_path, result_dir, file_base_name, current_date):
+    """분석된 데이터를 Excel 파일로 저장하는 함수"""
+    if not analyzed_data:
+        return False
+    
+    try:
+        # 공통 Excel 파일에 저장
+        export_to_structured_excel(analyzed_data, common_output_path)
+        logging.info(f"데이터가 공통 Excel 파일에 추가되었습니다: {common_output_path}")
+        return True
+    except Exception as e:
+        logging.error(f"공통 Excel 파일 저장 실패: {str(e)}")
+        
+        # 대체 경로 시도
+        try:
+            alt_output_path = Path.cwd() / "output.xlsx"
+            export_to_structured_excel(analyzed_data, alt_output_path)
+            logging.info(f"대체 경로에 Excel 파일 저장 성공: {alt_output_path}")
+            return True
+        except Exception as e2:
+            logging.error(f"대체 경로에도 Excel 파일 저장 실패: {str(e2)}")
+            
+            # 마지막 대안으로 개별 파일 저장
+            try:
+                individual_output_path = result_dir / f"output_{file_base_name}_{current_date}.xlsx"
+                export_to_structured_excel(analyzed_data, individual_output_path)
+                logging.info(f"개별 Excel 파일 저장 성공: {individual_output_path}")
+                return True
+            except Exception as e3:
+                logging.error(f"모든 저장 시도 실패: {str(e3)}")
+                return False
+
 def process_file(file_path, pbar=None):
     """파일 처리 함수"""
     # 파일 경로를 Path 객체로 변환
@@ -837,14 +952,14 @@ def process_file(file_path, pbar=None):
         current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M")  # 처리시간 형식 수정
 
         # 결과 디렉토리 확인 및 생성 (날짜별 폴더 구조)
-        result_dir = Path(RESULT_DIR) / current_date
+        result_dir = RESULT_DIR / current_date
         if not result_dir.exists():
             try:
                 result_dir.mkdir(parents=True, exist_ok=True)
             except Exception as e:
                 logging.error(f"결과 디렉토리 생성 실패: {str(e)}")
                 # 대체 경로 사용
-                result_dir = Path(os.getcwd()) / "results" / current_date
+                result_dir = Path.cwd() / "results" / current_date
                 result_dir.mkdir(parents=True, exist_ok=True)
 
         # 공통 output.xlsx 파일 경로 설정
@@ -865,6 +980,7 @@ def process_file(file_path, pbar=None):
 
             # 각 이미지에 대해 OCR 처리
             all_ocr_results = []
+            all_analyzed_data = []
 
             if pbar:
                 pbar.set_description(f"OCR 처리 중: {file_path.name}")
@@ -882,88 +998,32 @@ def process_file(file_path, pbar=None):
                     logging.error(f"OCR API 호출 실패: {image_path}")
                     continue
 
-                # JSON 결과 저장 (각 페이지별)
-                page_json_path = result_dir / f"{file_base_name}_page{i+1}_{os.getpid()}.json"
-
-                try:
-                    with open(page_json_path, "w", encoding="utf-8") as f:
-                        json.dump(ocr_result, f, ensure_ascii=False, indent=2)
-                except Exception as e:
-                    logging.error(f"JSON 결과 저장 실패: {str(e)}")
-                    # 대체 경로 시도
-                    page_json_path = Path(os.getcwd()) / f"{file_base_name}_page{i+1}_{os.getpid()}.json"
-                    with open(page_json_path, "w", encoding="utf-8") as f:
-                        json.dump(ocr_result, f, ensure_ascii=False, indent=2)
-
-                all_ocr_results.append(ocr_result)
-
-            # 모든 OCR 결과 분석
-            if pbar:
-                pbar.set_description(f"데이터 분석 중: {file_path.name}")
-                pbar.refresh()
-
-            for i, ocr_result in enumerate(all_ocr_results):
-                # OpenAI API를 사용하여 OCR 결과 분석
-                analyzed_data = analyze_ocr_with_openai(ocr_result)
-
+                # OCR 결과 처리 및 분석
+                analyzed_data = process_ocr_result(
+                    ocr_result, 
+                    file_path, 
+                    result_dir, 
+                    page_num=i+1, 
+                    total_pages=len(image_paths), 
+                    pbar=pbar
+                )
+                
                 if analyzed_data:
-                    # 원본 파일 정보 추가
-                    if "파일_정보" not in analyzed_data:
-                        analyzed_data["파일_정보"] = []
-
-                    # 신청일자 정보 추가
-                    if "신청일자" in analyzed_data and analyzed_data["신청일자"]:
-                        analyzed_data["파일_정보"].append(
-                            {"항목": "신청일자", "값": analyzed_data["신청일자"]}
-                        )
-
-                    # 기금구분 정보 추가 (가장 먼저 추가)
-                    if "기금구분" in analyzed_data and analyzed_data["기금구분"]:
-                        analyzed_data["파일_정보"].append(
-                            {"항목": "기금구분", "값": analyzed_data["기금구분"]}
-                        )
-
-                    # 세부사업 정보 추가
-                    if "세부사업" in analyzed_data and analyzed_data["세부사업"]:
-                        analyzed_data["파일_정보"].append(
-                            {"항목": "세부사업", "값": analyzed_data["세부사업"]}
-                        )
-                        
-                    # 목세목 정보 추가
-                    if "목세목" in analyzed_data and analyzed_data["목세목"]:
-                        analyzed_data["파일_정보"].append(
-                            {"항목": "목세목", "값": analyzed_data["목세목"]}
-                        )
-
-                    analyzed_data["파일_정보"].append(
-                        {"항목": "원본파일명", "값": file_path.name}
+                    # 파일 정보 추가
+                    analyzed_data = add_file_info(
+                        analyzed_data, 
+                        file_path, 
+                        current_datetime, 
+                        page_num=i+1, 
+                        total_pages=len(image_paths)
                     )
-
-                    analyzed_data["파일_정보"].append(
-                        {"항목": "처리시간", "값": current_datetime}  # current_date 대신 current_datetime 사용
-                    )
-
-                    analyzed_data["파일_정보"].append(
-                        {"항목": "페이지번호", "값": f"{i+1}/{len(all_ocr_results)}"}
-                    )
-
-                    # 구조화된 Excel 파일로 내보내기 (공통 파일에 추가)
-                    try:
-                        export_to_structured_excel(analyzed_data, common_output_path)
-                        logging.info(f"데이터가 공통 Excel 파일에 추가되었습니다: {common_output_path}")
-                    except Exception as e:
-                        logging.error(f"공통 Excel 파일 저장 실패: {str(e)}")
-                        # 대체 경로 시도
-                        alt_output_path = Path(os.getcwd()) / "output.xlsx"
-                        try:
-                            export_to_structured_excel(analyzed_data, alt_output_path)
-                            logging.info(f"대체 경로에 Excel 파일 저장 성공: {alt_output_path}")
-                        except Exception as e2:
-                            logging.error(f"대체 경로에도 Excel 파일 저장 실패: {str(e2)}")
-                            # 마지막 대안으로 개별 파일 저장
-                            individual_output_path = result_dir / f"output_{file_base_name}_{current_date}.xlsx"
-                            export_to_structured_excel(analyzed_data, individual_output_path)
-                            logging.info(f"개별 Excel 파일 저장 성공: {individual_output_path}")
+                    
+                    # Excel 파일 저장
+                    save_to_excel(analyzed_data, common_output_path, result_dir, file_base_name, current_date)
+                    
+                    all_analyzed_data.append(analyzed_data)
+                
+                all_ocr_results.append(ocr_result)
 
             # 처리 완료 후 임시 파일 정리 시도
             try:
@@ -1005,76 +1065,24 @@ def process_file(file_path, pbar=None):
                 logging.error(f"OCR API 호출 실패: {file_path}")
                 return
 
-            # JSON 결과 저장
-            json_result_path = result_dir / f"{file_base_name}_{os.getpid()}.json"
-            with open(json_result_path, "w", encoding="utf-8") as f:
-                json.dump(ocr_result, f, ensure_ascii=False, indent=2)
-
-            if pbar:
-                pbar.set_description(f"데이터 분석 중: {file_path.name}")
-                pbar.refresh()
-
-            # OpenAI API를 사용하여 OCR 결과 분석
-            analyzed_data = analyze_ocr_with_openai(ocr_result)
-
+            # OCR 결과 처리 및 분석
+            analyzed_data = process_ocr_result(
+                ocr_result, 
+                file_path, 
+                result_dir, 
+                pbar=pbar
+            )
+            
             if analyzed_data:
-                # 원본 파일 정보 추가
-                if "파일_정보" not in analyzed_data:
-                    analyzed_data["파일_정보"] = []
-
-                # 기금구분 정보 추가 (가장 먼저 추가)
-                if "기금구분" in analyzed_data and analyzed_data["기금구분"]:
-                    analyzed_data["파일_정보"].append(
-                        {"항목": "기금구분", "값": analyzed_data["기금구분"]}
-                    )
-
-                # 신청일자 정보 추가
-                if "신청일자" in analyzed_data and analyzed_data["신청일자"]:
-                    analyzed_data["파일_정보"].append(
-                        {"항목": "신청일자", "값": analyzed_data["신청일자"]}
-                    )
-
-                # 세부사업 정보 추가
-                if "세부사업" in analyzed_data and analyzed_data["세부사업"]:
-                    analyzed_data["파일_정보"].append(
-                        {"항목": "세부사업", "값": analyzed_data["세부사업"]}
-                    )
-                    
-                # 목세목 정보 추가
-                if "목세목" in analyzed_data and analyzed_data["목세목"]:
-                    analyzed_data["파일_정보"].append(
-                        {"항목": "목세목", "값": analyzed_data["목세목"]}
-                    )
-
-                analyzed_data["파일_정보"].append(
-                    {"항목": "원본파일명", "값": file_path.name}
+                # 파일 정보 추가
+                analyzed_data = add_file_info(
+                    analyzed_data, 
+                    file_path, 
+                    current_datetime
                 )
-
-                analyzed_data["파일_정보"].append(
-                    {"항목": "처리시간", "값": current_datetime}  # current_date 대신 current_datetime 사용
-                )
-
-                analyzed_data["파일_정보"].append(
-                    {"항목": "페이지번호", "값": f"{i+1}/{len(all_ocr_results)}"}
-                )
-
-                # 구조화된 Excel 파일로 내보내기 (공통 파일에 추가)
-                try:
-                    export_to_structured_excel(analyzed_data, common_output_path)
-                    logging.info(f"데이터가 공통 Excel 파일에 추가되었습니다: {common_output_path}")
-                except Exception as e:
-                    logging.error(f"공통 Excel 파일 저장 실패: {str(e)}")
-                    # 대체 경로 시도
-                    alt_output_path = Path(os.getcwd()) / "output.xlsx"
-                    try:
-                        export_to_structured_excel(analyzed_data, alt_output_path)
-                        logging.info(f"대체 경로에 Excel 파일 저장 성공: {alt_output_path}")
-                    except Exception as e2:
-                        logging.error(f"대체 경로에도 Excel 파일 저장 실패: {str(e2)}")
-                        # 마지막 대안으로 개별 파일 저장
-                        individual_output_path = result_dir / f"output_{file_base_name}_{current_date}.xlsx"
-                        export_to_structured_excel(analyzed_data, individual_output_path)
-                        logging.info(f"개별 Excel 파일 저장 성공: {individual_output_path}")
+                
+                # Excel 파일 저장
+                save_to_excel(analyzed_data, common_output_path, result_dir, file_base_name, current_date)
 
             logging.info(f"이미지 파일 처리 완료: {file_path}")
 
@@ -1086,11 +1094,10 @@ def process_file(file_path, pbar=None):
 def process_existing_files():
     """기존 파일 처리"""
     # 소스 디렉토리 확인
-    source_dir = Path(SOURCE_DIR)
-    if not source_dir.exists():
+    if not SOURCE_DIR.exists():
         try:
-            source_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"소스 디렉토리 생성: {source_dir}")
+            SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+            logging.info(f"소스 디렉토리 생성: {SOURCE_DIR}")
         except Exception as e:
             logging.error(f"소스 디렉토리 생성 실패: {str(e)}")
             return
@@ -1099,7 +1106,7 @@ def process_existing_files():
     supported_extensions = ALL_SUPPORTED_EXTENSIONS
 
     # 소스 디렉토리에서 지원되는 파일 찾기
-    files = [f for f in source_dir.glob("*") if f.suffix.lower() in supported_extensions]
+    files = [f for f in SOURCE_DIR.glob("*") if f.suffix.lower() in supported_extensions]
 
     if not files:
         return
@@ -1147,10 +1154,6 @@ def main():
             logging.error(f"필수 환경 변수 {var}가 설정되지 않았습니다.")
             sys.exit(1)
 
-    # 소스 디렉토리 및 결과 디렉토리 설정
-    SOURCE_DIR = Path("source")
-    RESULT_DIR = Path("result")
-
     # 기존 파일 처리
     process_existing_files()
 
@@ -1158,7 +1161,7 @@ def main():
         # 파일 감시 시작
         event_handler = FileHandler()
         observer = Observer()  # watchdog.observers.polling.PollingObserver() 대신 Observer 사용
-        observer.schedule(event_handler, SOURCE_DIR, recursive=False)
+        observer.schedule(event_handler, str(SOURCE_DIR), recursive=False)
         observer.start()
 
         print(f"파일 감시 시작: {SOURCE_DIR}")
