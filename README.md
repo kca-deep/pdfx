@@ -1,17 +1,17 @@
-# 네이버 클로바 OCR API와 OpenAI API를 활용한 문서 분석 도구
+# PDF-X: PDF 문서 분석 및 데이터 추출 도구
 
-이 도구는 이미지 및 PDF 파일에서 텍스트를 추출하고, OpenAI API를 활용하여 데이터를 분석한 후 Excel 파일로 변환하는 기능을 제공합니다.
+이 도구는 PDF 파일에서 텍스트를 추출하고, 네이버 클로바 OCR API와 OpenAI API를 활용하여 데이터를 분석한 후 Excel 파일로 변환하는 기능을 제공합니다.
 
 ## 주요 기능
 
-1. **파일 감지 및 자동 처리**: `source` 폴더에 새 이미지 또는 PDF 파일이 업로드되면 자동으로 감지하여 처리합니다.
+1. **폴더 기반 자동 처리**: `source` 폴더 내 하위 폴더에 있는 PDF 파일을 자동으로 감지하여 처리합니다.
 2. **PDF 변환 및 처리**: PDF 파일을 이미지로 변환하여 각 페이지를 개별적으로 처리합니다.
 3. **OCR 텍스트 추출**: 네이버 클로바 OCR API를 사용하여 이미지에서 텍스트를 추출합니다.
 4. **데이터 분석**: OpenAI API(gpt-4o-mini 모델)를 사용하여 추출된 텍스트에서 금액 데이터와 은행 정보를 분석합니다.
 5. **데이터 구조화**: 분석된 데이터를 구조화하여 Excel 파일로 변환합니다.
-6. **날짜별 결과 관리**: 처리된 결과는 날짜별 폴더에 저장되며, 하나의 Excel 파일에 누적됩니다.
+6. **날짜별 결과 관리**: 처리된 결과는 날짜별로 관리되며, 하나의 Excel 파일에 누적됩니다.
 7. **날짜별 로그 관리**: 로그는 날짜별로 별도 파일에 저장됩니다.
-8. **병합 파일 관리**: 처리된 파일은 `merged` 폴더에 병합되어 저장됩니다.
+8. **병합 파일 관리**: 처리된 파일은 원본 폴더 구조를 유지하며 `merged` 폴더에 병합되어 저장됩니다.
 
 ## 시스템 요구사항
 
@@ -24,17 +24,6 @@
    ```
    pip install -r requirements.txt
    ```
-
-   설치되는 주요 패키지:
-   - watchdog 6.0.0: 파일 시스템 이벤트 모니터링 (Python 3.13 호환)
-   - PyMuPDF 1.25.3: PDF 처리 (Python 3.13 호환)
-   - Pillow 11.1.0: 이미지 처리 (Python 3.13 호환)
-   - requests 2.31.0: HTTP 요청 처리
-   - openpyxl 3.1.2: Excel 파일 처리
-   - tqdm 4.66.1: 진행률 표시
-   - python-dotenv 1.0.0: 환경 변수 관리
-   - openai 1.12.0: OpenAI API 사용 (gpt-4o-mini 모델 지원)
-   - Flask 3.0.0: 웹 애플리케이션 프레임워크 (선택적)
 
 2. 환경 설정:
    - 프로젝트 루트 디렉토리에 `.env` 파일을 생성하고 다음과 같이 설정합니다:
@@ -52,58 +41,49 @@
      MERGED_DIR=merged  # 병합 폴더 경로
      RESULT_DIR=result  # 결과 폴더 경로
      TEMP_DIR=temp  # 임시 폴더 경로
+     LOG_DIR=logs  # 로그 폴더 경로
      LOG_LEVEL=INFO  # 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
      ```
-   - 또는 환경 변수로 직접 설정할 수도 있습니다:
-     - Windows: 
-       ```
-       set CLOVA_OCR_SECRET_KEY=your_api_key_here
-       set CLOVA_OCR_APIGW_INVOKE_URL=your_api_gateway_url_here
-       set OPENAI_API_KEY=your_openai_api_key_here
-       ```
-     - Linux/Mac: 
-       ```
-       export CLOVA_OCR_SECRET_KEY=your_api_key_here
-       export CLOVA_OCR_APIGW_INVOKE_URL=your_api_gateway_url_here
-       export OPENAI_API_KEY=your_openai_api_key_here
-       ```
 
 ## 사용 방법
 
-1. `source` 폴더에 이미지 또는 PDF 파일을 업로드합니다.
+1. `source` 폴더 내에 하위 폴더를 생성하고 PDF 파일을 업로드합니다.
+   - 예: `source/테스트1/문서1.pdf`, `source/테스트2/문서2.pdf`
+   
 2. 다음 명령어로 프로그램을 실행합니다:
    ```
    python main.py
    ```
+   
 3. 프로그램이 자동으로 파일을 감지하고 처리합니다.
-4. 처리 결과는 `result/YYYYMMDD` 폴더에 `output.xlsx` 파일로 저장됩니다.
-5. 로그는 `logs/pdfx_YYYYMMDD.log` 파일에 저장됩니다.
-6. 병합된 JSONL 파일은 `merged/YYYYMMDD` 폴더에 저장됩니다.
+   - PDF 파일은 이미지로 변환됩니다.
+   - 이미지는 OCR 처리되어 텍스트가 추출됩니다.
+   - 추출된 텍스트는 OpenAI API를 통해 분석됩니다.
+   - 분석 결과는 Excel 파일로 저장됩니다.
 
-### 기존 파일 처리
-
-프로그램 실행 시 `source` 폴더에 이미 존재하는 파일도 자동으로 처리됩니다.
+4. 처리 결과는 `result/output_YYYYMMDD.xlsx` 파일로 저장됩니다.
+5. 로그는 `logs/log_YYYYMMDD.log` 파일에 저장됩니다.
+6. 병합된 JSONL 파일은 `merged/[하위폴더명]/[하위폴더명].jsonl` 형태로 저장됩니다.
 
 ## 폴더 구조
 
-- `source/`: 처리할 이미지 또는 PDF 파일을 이 폴더에 업로드합니다.
-- `merged/YYYYMMDD/`: 날짜별로 병합된 JSONL 파일이 저장되는 폴더입니다.
-- `result/YYYYMMDD/`: 날짜별로 처리 결과가 저장되는 폴더입니다.
+- `source/`: 처리할 PDF 파일을 포함하는 하위 폴더를 생성하는 곳입니다.
+- `merged/`: 원본 폴더 구조를 유지하며 병합된 JSONL 파일이 저장되는 폴더입니다.
+- `result/`: 처리 결과가 저장되는 폴더입니다.
 - `temp/YYYYMMDD/`: 날짜별로 임시 파일이 저장되는 폴더입니다 (자동 생성).
 - `logs/`: 로그 파일이 저장되는 폴더입니다.
 
 ## 지원 파일 형식
 
-- 이미지: `.jpg`, `.jpeg`, `.png`, `.tiff`, `.tif`, `.bmp`
 - PDF: `.pdf`
 
 ## 로그
 
-프로그램 실행 중 발생하는 모든 이벤트는 `logs/pdfx_YYYYMMDD.log` 파일에 기록됩니다. 로그는 날짜별로 별도 파일에 저장됩니다.
+프로그램 실행 중 발생하는 모든 이벤트는 `logs/log_YYYYMMDD.log` 파일에 기록됩니다. 로그는 날짜별로 별도 파일에 저장됩니다.
 
 ## 결과 파일
 
-처리 결과는 `result/YYYYMMDD/output.xlsx` 파일에 저장됩니다. 같은 날짜에 처리된 모든 파일의 결과가 하나의 Excel 파일에 누적됩니다.
+처리 결과는 `result/output_YYYYMMDD.xlsx` 파일에 저장됩니다. 같은 날짜에 처리된 모든 파일의 결과가 하나의 Excel 파일에 누적됩니다.
 
 Excel 파일에는 다음 정보가 포함됩니다:
 - 원본 파일명
@@ -126,6 +106,7 @@ Excel 파일에는 다음 정보가 포함됩니다:
 | MERGED_DIR | 병합 폴더 경로 | merged |
 | RESULT_DIR | 결과 폴더 경로 | result |
 | TEMP_DIR | 임시 폴더 경로 | temp |
+| LOG_DIR | 로그 폴더 경로 | logs |
 | LOG_LEVEL | 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL) | INFO |
 
 ## API 정보
@@ -158,27 +139,6 @@ Python 3.13에서는 스레딩 모듈의 변경으로 인해 일부 패키지에
 - **Pillow 11.1.0**: Python 3.13과 호환되는 버전으로, 이전 버전에서 발생하는 `KeyError: '__version__'` 오류를 해결합니다.
 - **PyMuPDF 1.25.3**: Python 3.13과 호환되는 버전으로, PDF 처리 기능을 제공합니다.
 
-만약 여전히 watchdog 관련 문제가 발생한다면, 코드에서 일반 Observer 대신 PollingObserver를 사용하는 방법도 고려할 수 있습니다:
-
-```python
-# 기존 코드
-from watchdog.observers import Observer
-
-# 변경 코드
-from watchdog.observers.polling import PollingObserver as Observer
-```
-
 ### OpenAI API 모델 설정
 
-이 프로젝트는 기본적으로 OpenAI의 gpt-4o-mini 모델을 사용합니다. 다른 모델을 사용하려면 코드에서 모델 이름을 변경해야 합니다. gpt-4o-mini 모델은 비용 효율적이면서도 높은 성능을 제공합니다.
-
-## 웹 애플리케이션 실행 (선택적)
-
-이 프로젝트는 선택적으로 Flask 웹 프레임워크를 사용하여 웹 인터페이스를 제공할 수 있습니다:
-
-1. 다음 명령어로 웹 애플리케이션을 실행합니다:
-   ```
-   python app.py
-   ```
-2. 웹 브라우저에서 `http://localhost:5000`으로 접속합니다.
-3. 웹 인터페이스를 통해 파일을 업로드하고 처리 결과를 확인할 수 있습니다. 
+이 프로젝트는 기본적으로 OpenAI의 gpt-4o-mini 모델을 사용합니다. 이 모델은 비용 효율적이면서도 높은 성능을 제공합니다. 
