@@ -7,10 +7,11 @@
 1. **파일 감지 및 자동 처리**: `source` 폴더에 새 이미지 또는 PDF 파일이 업로드되면 자동으로 감지하여 처리합니다.
 2. **PDF 변환 및 처리**: PDF 파일을 이미지로 변환하여 각 페이지를 개별적으로 처리합니다.
 3. **OCR 텍스트 추출**: 네이버 클로바 OCR API를 사용하여 이미지에서 텍스트를 추출합니다.
-4. **데이터 분석**: OpenAI API를 사용하여 추출된 텍스트에서 금액 데이터와 은행 정보를 분석합니다.
+4. **데이터 분석**: OpenAI API(gpt-4o-mini 모델)를 사용하여 추출된 텍스트에서 금액 데이터와 은행 정보를 분석합니다.
 5. **데이터 구조화**: 분석된 데이터를 구조화하여 Excel 파일로 변환합니다.
 6. **날짜별 결과 관리**: 처리된 결과는 날짜별 폴더에 저장되며, 하나의 Excel 파일에 누적됩니다.
 7. **날짜별 로그 관리**: 로그는 날짜별로 별도 파일에 저장됩니다.
+8. **병합 파일 관리**: 처리된 파일은 `merged` 폴더에 병합되어 저장됩니다.
 
 ## 시스템 요구사항
 
@@ -32,6 +33,8 @@
    - openpyxl 3.1.2: Excel 파일 처리
    - tqdm 4.66.1: 진행률 표시
    - python-dotenv 1.0.0: 환경 변수 관리
+   - openai 1.12.0: OpenAI API 사용 (gpt-4o-mini 모델 지원)
+   - Flask 3.0.0: 웹 애플리케이션 프레임워크 (선택적)
 
 2. 환경 설정:
    - 프로젝트 루트 디렉토리에 `.env` 파일을 생성하고 다음과 같이 설정합니다:
@@ -45,6 +48,10 @@
      
      # 기타 설정 (선택 사항)
      MAX_FILE_SIZE=16777216  # 최대 파일 크기 (바이트 단위, 기본값: 16MB)
+     SOURCE_DIR=source  # 소스 폴더 경로
+     MERGED_DIR=merged  # 병합 폴더 경로
+     RESULT_DIR=result  # 결과 폴더 경로
+     TEMP_DIR=temp  # 임시 폴더 경로
      LOG_LEVEL=INFO  # 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL)
      ```
    - 또는 환경 변수로 직접 설정할 수도 있습니다:
@@ -71,6 +78,7 @@
 3. 프로그램이 자동으로 파일을 감지하고 처리합니다.
 4. 처리 결과는 `result/YYYYMMDD` 폴더에 `output.xlsx` 파일로 저장됩니다.
 5. 로그는 `logs/pdfx_YYYYMMDD.log` 파일에 저장됩니다.
+6. 병합된 JSONL 파일은 `merged/YYYYMMDD` 폴더에 저장됩니다.
 
 ### 기존 파일 처리
 
@@ -79,6 +87,7 @@
 ## 폴더 구조
 
 - `source/`: 처리할 이미지 또는 PDF 파일을 이 폴더에 업로드합니다.
+- `merged/YYYYMMDD/`: 날짜별로 병합된 JSONL 파일이 저장되는 폴더입니다.
 - `result/YYYYMMDD/`: 날짜별로 처리 결과가 저장되는 폴더입니다.
 - `temp/YYYYMMDD/`: 날짜별로 임시 파일이 저장되는 폴더입니다 (자동 생성).
 - `logs/`: 로그 파일이 저장되는 폴더입니다.
@@ -114,6 +123,7 @@ Excel 파일에는 다음 정보가 포함됩니다:
 | OPENAI_API_KEY | OpenAI API 키 | (필수) |
 | MAX_FILE_SIZE | 최대 파일 크기 (바이트 단위) | 16777216 (16MB) |
 | SOURCE_DIR | 소스 폴더 경로 | source |
+| MERGED_DIR | 병합 폴더 경로 | merged |
 | RESULT_DIR | 결과 폴더 경로 | result |
 | TEMP_DIR | 임시 폴더 경로 | temp |
 | LOG_LEVEL | 로그 레벨 (DEBUG, INFO, WARNING, ERROR, CRITICAL) | INFO |
@@ -126,9 +136,10 @@ Excel 파일에는 다음 정보가 포함됩니다:
 - [API 문서](https://api.ncloud-docs.com/docs/ai-application-service-ocr)
 
 ### OpenAI API
-이 도구는 OpenAI의 GPT 모델을 사용하여 OCR 결과를 분석합니다. API에 대한 자세한 정보는 다음 링크에서 확인할 수 있습니다:
+이 도구는 OpenAI의 GPT 모델(gpt-4o-mini)을 사용하여 OCR 결과를 분석합니다. API에 대한 자세한 정보는 다음 링크에서 확인할 수 있습니다:
 - [OpenAI API](https://platform.openai.com/)
 - [API 문서](https://platform.openai.com/docs/api-reference)
+- [gpt-4o-mini 모델 정보](https://platform.openai.com/docs/models/gpt-4o-mini)
 
 ## 주의사항
 
@@ -155,4 +166,19 @@ from watchdog.observers import Observer
 
 # 변경 코드
 from watchdog.observers.polling import PollingObserver as Observer
-``` 
+```
+
+### OpenAI API 모델 설정
+
+이 프로젝트는 기본적으로 OpenAI의 gpt-4o-mini 모델을 사용합니다. 다른 모델을 사용하려면 코드에서 모델 이름을 변경해야 합니다. gpt-4o-mini 모델은 비용 효율적이면서도 높은 성능을 제공합니다.
+
+## 웹 애플리케이션 실행 (선택적)
+
+이 프로젝트는 선택적으로 Flask 웹 프레임워크를 사용하여 웹 인터페이스를 제공할 수 있습니다:
+
+1. 다음 명령어로 웹 애플리케이션을 실행합니다:
+   ```
+   python app.py
+   ```
+2. 웹 브라우저에서 `http://localhost:5000`으로 접속합니다.
+3. 웹 인터페이스를 통해 파일을 업로드하고 처리 결과를 확인할 수 있습니다. 
