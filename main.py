@@ -17,10 +17,17 @@ from tqdm import tqdm
 import openpyxl
 from openpyxl.styles import Alignment, numbers, PatternFill
 from openpyxl.formatting.rule import CellIsRule
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# -----------------------------------------------------------------------------
+# 모델 요금 관련 상수 (예시)
+# -----------------------------------------------------------------------------
+GPT4O_MINI_PROMPT_COST_PER_1000 = 0.03  # 1,000 입력 토큰 당 비용 (USD)
+GPT4O_MINI_COMPLETION_COST_PER_1000 = 0.06  # 1,000 출력 토큰 당 비용 (USD)
+EXCHANGE_RATE = 1480  # 1 USD = 1480 KRW
 
 
 # =============================================================================
@@ -136,7 +143,7 @@ def ocr_result_to_jsonl_lines(ocr_result: Dict[str, Any]) -> List[Dict[str, Any]
 
 
 # =============================================================================
-# OpenAI API 분석 함수
+# OpenAI API 분석 함수 (토큰 사용량 취합)
 # =============================================================================
 def analyze_merged_jsonl(
     merged_text: str,
@@ -144,9 +151,10 @@ def analyze_merged_jsonl(
     openai_api_url: str,
     session: Optional[requests.Session] = None,
     timeout: int = 60,
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, int]]:
     """
-    병합된 JSONL 텍스트를 OpenAI API를 통해 분석하여 지정 항목을 추출
+    병합된 JSONL 텍스트를 OpenAI API를 통해 분석하여 지정 항목을 추출하고,
+    응답의 토큰 사용량(prompt, completion)을 반환
     """
     prompt = f"""다음은 병합된 jsonl 파일의 내용입니다. 각 줄은 OCR 결과의 일부입니다.
 아래 항목들을 추출하여 JSON 형식으로 반환해줘.
@@ -186,6 +194,9 @@ def analyze_merged_jsonl(
         )
         if response.status_code == 200:
             result = response.json()
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
             choices = result.get("choices")
             if (
                 not choices
@@ -193,27 +204,39 @@ def analyze_merged_jsonl(
                 or "message" not in choices[0]
             ):
                 logging.error("OpenAI API 응답 구조가 예상과 다릅니다.")
-                return None
+                return None, {}
             content = choices[0]["message"].get("content", "")
             try:
                 data = json.loads(content)
-                return data
+                return data, {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": usage.get(
+                        "total_tokens", prompt_tokens + completion_tokens
+                    ),
+                }
             except json.JSONDecodeError:
                 cleaned = extract_json_using_regex(content)
                 try:
                     data = json.loads(cleaned)
-                    return data
+                    return data, {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": usage.get(
+                            "total_tokens", prompt_tokens + completion_tokens
+                        ),
+                    }
                 except json.JSONDecodeError:
                     logging.error("OpenAI 응답 JSON 파싱 실패")
                     logging.error(content)
-                    return None
+                    return None, {}
         else:
             logging.error(f"OpenAI API 호출 실패, 상태코드: {response.status_code}")
             logging.error(response.text)
-            return None
+            return None, {}
     except requests.RequestException as e:
         logging.exception(f"OpenAI API 호출 중 오류 발생: {e}")
-        return None
+        return None, {}
 
 
 # =============================================================================
@@ -471,15 +494,18 @@ def process_subfolder_target(target_folder: Union[str, Path]) -> None:
 # =============================================================================
 def run_all_tasks(
     config: Dict[str, Any], session: requests.Session
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     전체 작업을 단계별로 실행:
      - 파일 처리 (OCR 및 JSONL 생성)
      - JSONL 병합
      - OpenAI 분석
-    각 단계는 별도의 진행률바로 표시됨.
+    각 단계는 별도의 진행률바(색상 포함)로 표시됨.
+    반환값: (전체 분석 결과 리스트, {'prompt_tokens': 총입력토큰, 'completion_tokens': 총출력토큰})
     """
     overall_results = []
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
     source_dir: Path = config["SOURCE_DIR"]
     merged_dir: Path = config["MERGED_DIR"]
 
@@ -542,20 +568,25 @@ def run_all_tasks(
                 with open(merged_file, "r", encoding="utf-8") as f:
                     merged_text = f.read()
                 logging.info(f"분석 시작: {merged_file.name}")
-                result = analyze_merged_jsonl(
+                data, usage = analyze_merged_jsonl(
                     merged_text,
                     config["OPENAI_API_KEY"],
                     config["OPENAI_API_URL"],
                     session=session,
                     timeout=60,
                 )
-                if result:
-                    overall_results.append(result)
+                if data:
+                    overall_results.append(data)
+                total_prompt_tokens += usage.get("prompt_tokens", 0)
+                total_completion_tokens += usage.get("completion_tokens", 0)
             except Exception as e:
                 logging.exception(f"분석 파일 처리 실패: {merged_file}, 오류: {e}")
             pbar_analysis.update(1)
 
-    return overall_results
+    return overall_results, {
+        "prompt_tokens": total_prompt_tokens,
+        "completion_tokens": total_completion_tokens,
+    }
 
 
 # =============================================================================
@@ -688,9 +719,22 @@ def main() -> None:
     session = get_retry_session()
 
     # 단계별 진행: 파일 처리, JSONL 병합, OpenAI 분석
-    results = run_all_tasks(config, session)
+    results, token_usage = run_all_tasks(config, session)
 
-    # Excel 파일 생성 단계 (진행률바 1단계)
+    # 토큰 사용량과 모델 요금 계산
+    total_prompt_tokens = token_usage["prompt_tokens"]
+    total_completion_tokens = token_usage["completion_tokens"]
+    cost_dollars = (
+        total_prompt_tokens * GPT4O_MINI_PROMPT_COST_PER_1000
+        + total_completion_tokens * GPT4O_MINI_COMPLETION_COST_PER_1000
+    ) / 1000.0
+    cost_krw = cost_dollars * EXCHANGE_RATE
+    logging.info(
+        f"총 입력 토큰: {total_prompt_tokens}, 총 출력 토큰: {total_completion_tokens}"
+    )
+    logging.info(f"모델 요금: ${cost_dollars:.4f} (USD), {cost_krw:.0f} (KRW)")
+
+    # Excel 파일 생성 단계
     output_excel = (
         config["RESULT_DIR"] / f"output_{datetime.now().strftime('%Y%m%d')}.xlsx"
     )
